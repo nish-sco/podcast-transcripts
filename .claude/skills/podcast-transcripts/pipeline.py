@@ -7,6 +7,8 @@ import argparse
 import difflib
 import html as html_lib
 import json
+import math
+import os
 import re
 import shlex
 import sys
@@ -120,6 +122,8 @@ def request_with_retry(
             else:
                 raise ValueError(f"unsupported HTTP method: {method}")
             response.raise_for_status()
+            if "charset" not in response.headers.get("Content-Type", "").lower():
+                response.encoding = "utf-8"  # requests would otherwise assume ISO-8859-1.
             return response
         except Exception as exc:  # requests and HTTP-status failures are retriable API failures.
             last_error = exc
@@ -252,6 +256,59 @@ class FeedEpisode:
     audio_url: str
     description: str
     pub_date: str
+    transcript_url: str = ""
+    transcript_type: str = ""
+    duration_seconds: int = 0
+
+
+# Podcasting 2.0 transcript types in preference order; unknown types rank last.
+TRANSCRIPT_TYPE_PREFERENCE = (
+    "text/vtt",
+    "application/x-subrip",
+    "application/srt",
+    "application/json",
+    "text/html",
+    "text/plain",
+)
+
+
+def _transcript_type_rank(transcript_type: str) -> int:
+    normalized = (transcript_type or "").split(";", 1)[0].strip().lower()
+    try:
+        return TRANSCRIPT_TYPE_PREFERENCE.index(normalized)
+    except ValueError:
+        return len(TRANSCRIPT_TYPE_PREFERENCE)
+
+
+def _duration_seconds(value: str) -> int:
+    """Parse an itunes:duration value (HH:MM:SS, MM:SS, or seconds); 0 on failure."""
+
+    text = (value or "").strip()
+    if not text:
+        return 0
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) > 3:
+            return 0
+        try:
+            numbers = [int(part) for part in parts]
+        except ValueError:
+            return 0
+        if any(number < 0 for number in numbers):
+            return 0
+        if any(number >= 60 for number in numbers[1:]):
+            return 0
+        seconds = 0
+        for number in numbers:
+            seconds = seconds * 60 + number
+        return seconds
+    try:
+        seconds = float(text)
+    except (ValueError, OverflowError):
+        return 0
+    if not math.isfinite(seconds) or seconds < 0:
+        return 0
+    return int(seconds)
 
 
 def _local_name(tag: Any) -> str:
@@ -299,12 +356,35 @@ def parse_feed(feed_text: str) -> Tuple[str, List[FeedEpisode]]:
         if not _element_text(description_element):
             description_element = _direct_child(item, {"summary"})
         pub_date = _element_text(_direct_child(item, {"pubdate", "published", "date"}))
+
+        transcript_url = ""
+        transcript_type = ""
+        best_rank = len(TRANSCRIPT_TYPE_PREFERENCE) + 1
+        for child in list(item):
+            if _local_name(child.tag) != "transcript":
+                continue
+            candidate_url = (child.attrib.get("url") or "").strip()
+            if not candidate_url:
+                continue
+            candidate_type = (child.attrib.get("type") or "").strip()
+            rank = _transcript_type_rank(candidate_type)
+            if rank < best_rank:
+                best_rank = rank
+                transcript_url = candidate_url
+                transcript_type = candidate_type
+
+        duration_element = _direct_child(item, {"duration"})
+        duration = _duration_seconds(_element_text(duration_element))
+
         episodes.append(
             FeedEpisode(
                 title=html_lib.unescape(title).strip(),
                 audio_url=html_lib.unescape(audio_url).strip(),
                 description=strip_html(_element_text(description_element)),
                 pub_date=html_lib.unescape(pub_date).strip(),
+                transcript_url=html_lib.unescape(transcript_url).strip(),
+                transcript_type=html_lib.unescape(transcript_type).strip(),
+                duration_seconds=duration,
             )
         )
 
@@ -425,8 +505,11 @@ def _record(
     audio_url: str = "",
     description: str = "",
     pub_date: str = "",
+    transcript_url: str = "",
+    transcript_type: str = "",
+    duration_seconds: int = 0,
     status: str = "resolved",
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     return {
         "page_url": page_url,
         "show": show,
@@ -434,6 +517,9 @@ def _record(
         "audio_url": audio_url,
         "description": strip_html(description),
         "pub_date": pub_date,
+        "transcript_url": transcript_url,
+        "transcript_type": transcript_type,
+        "duration_seconds": int(duration_seconds or 0),
         "status": status,
     }
 
@@ -443,7 +529,7 @@ def _feed_record(
     page_metadata_values: Dict[str, str],
     show: str,
     episode: FeedEpisode,
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     return _record(
         page_url,
         show=show or page_metadata_values.get("show", ""),
@@ -451,6 +537,9 @@ def _feed_record(
         audio_url=episode.audio_url,
         description=episode.description,
         pub_date=episode.pub_date,
+        transcript_url=episode.transcript_url,
+        transcript_type=episode.transcript_type,
+        duration_seconds=episode.duration_seconds,
     )
 
 
@@ -467,6 +556,18 @@ def resolve_page(page_url: str, resolver: Resolver) -> Dict[str, str]:
     metadata = page_metadata(markup)
     page_title = metadata.get("title", "")
     display_title = page_title or _fallback_title(page_url)
+
+    # 0. The link itself is an Apple episode: prefer its RSS item, which carries
+    # the publisher transcript and duration that the page's audio URL lacks.
+    apple_self = APPLE_EPISODE_RE.search(page_url)
+    if apple_self:
+        try:
+            feed_url = resolver.lookup_feed_url(apple_self.group(1))
+            show, episodes = resolver.fetch_feed(feed_url)
+            episode = _match_feed_episode(episodes, page_title, page_url)
+            return _feed_record(page_url, metadata, show, episode)
+        except Exception:
+            pass  # Fall back to the page's own audio URL below.
 
     # 1. Direct audio URL in the page HTML.
     direct_audio = AUDIO_RE.search(markup)
@@ -564,30 +665,34 @@ def _repo_root() -> Path:
 
 
 def read_deepgram_key() -> str:
-    """Read DEEPGRAM_API_KEY from the repository .env without requiring export."""
+    """Read DEEPGRAM_API_KEY from the environment or the repository .env."""
+
+    env_value = os.environ.get("DEEPGRAM_API_KEY", "").strip()
+    if env_value:
+        return env_value
 
     env_path = _repo_root() / ".env"
-    if not env_path.is_file():
-        raise RuntimeError(f"missing .env at repository root: {env_path}")
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].lstrip()
-        name, separator, raw_value = line.partition("=")
-        if separator and name.strip() == "DEEPGRAM_API_KEY":
-            value = raw_value.strip()
-            try:
-                parsed = shlex.split(value, comments=True, posix=True)
-                value = parsed[0] if parsed else ""
-            except ValueError:
-                value = value.strip("\"'")
-            if value:
-                return value
-            break
-    raise RuntimeError("DEEPGRAM_API_KEY is missing or empty in the repository .env")
+    if env_path.is_file():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            name, separator, raw_value = line.partition("=")
+            if separator and name.strip() == "DEEPGRAM_API_KEY":
+                value = raw_value.strip()
+                try:
+                    parsed = shlex.split(value, comments=True, posix=True)
+                    value = parsed[0] if parsed else ""
+                except ValueError:
+                    value = value.strip("\"'")
+                if value:
+                    return value
+                break
+    raise RuntimeError(
+        "DEEPGRAM_API_KEY not set. Add it to the .env file in the repo root (see README)."
+    )
 
 
 def _transcript_from_response(payload: Dict[str, Any]) -> str:
@@ -680,6 +785,151 @@ def transcribe_audio(audio_url: str, api_key: str) -> str:
     return _transcript_from_response(payload)
 
 
+def _cue_speaker_text(value: str) -> Tuple[str, str]:
+    """Extract a <v Speaker> name from a cue and strip its remaining tags."""
+
+    speaker = ""
+
+    def _capture_voice(match: "re.Match[str]") -> str:
+        nonlocal speaker
+        name = (match.group(1) or "").strip()
+        if name and not speaker:
+            speaker = name
+        return ""
+
+    text = re.sub(r"<\s*v\s+([^>]*?)\s*>", _capture_voice, value, flags=re.IGNORECASE)
+    text = re.sub(r"</\s*v\s*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]*>", "", text)
+    text = html_lib.unescape(text)
+    return speaker, re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_cues(raw: str) -> List[Tuple[str, str]]:
+    """Parse VTT/SRT text into (speaker, cue text) pairs."""
+
+    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    cues: List[Tuple[str, str]] = []
+    for block in re.split(r"\n\s*\n", normalized):
+        lines = [line for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        first = lines[0].strip().upper()
+        if re.match(r"(NOTE|STYLE|REGION)(\s|$)", first):
+            continue
+        content_lines: List[str] = []
+        for line in lines:
+            stripped = line.strip().upper()
+            if stripped.startswith(("WEBVTT", "X-TIMESTAMP-MAP=", "KIND:", "LANGUAGE:")):
+                continue
+            if "-->" in line:
+                # The line immediately before a timestamp is a cue identifier.
+                if content_lines:
+                    content_lines.pop()
+                continue
+            content_lines.append(line)
+        if not content_lines:
+            continue
+        speaker, content = _cue_speaker_text(" ".join(content_lines))
+        if content:
+            cues.append((speaker, content))
+    return cues
+
+
+def _merge_speaker_cues(cues: List[Tuple[str, str]]) -> str:
+    """Merge consecutive cues from the same speaker into one paragraph."""
+
+    blocks: List[Tuple[str, List[str]]] = []
+    for speaker, content in cues:
+        if blocks and blocks[-1][0] == speaker:
+            blocks[-1][1].append(content)
+        else:
+            blocks.append((speaker, [content]))
+    paragraphs = []
+    for speaker, parts in blocks:
+        text = " ".join(parts).strip()
+        if not text:
+            continue
+        paragraphs.append(f"{speaker}: {text}" if speaker else text)
+    return "\n\n".join(paragraphs)
+
+
+def _json_transcript_to_text(raw: str) -> str:
+    """Convert a Podcasting 2.0 JSON transcript into speaker-merged text."""
+
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"publisher transcript JSON could not be parsed: {exc}") from exc
+    if isinstance(payload, dict):
+        segments = payload.get("segments", [])
+    else:
+        segments = payload
+    cues: List[Tuple[str, str]] = []
+    for segment in segments if isinstance(segments, list) else []:
+        if not isinstance(segment, dict):
+            continue
+        body = str(segment.get("body", segment.get("text", "")) or "").strip()
+        if not body:
+            continue
+        speaker = str(segment.get("speaker", "") or "").strip()
+        cues.append((speaker, re.sub(r"\s+", " ", body)))
+    if not cues:
+        raise RuntimeError("publisher transcript JSON contained no segments")
+    return _merge_speaker_cues(cues)
+
+
+def _html_transcript_to_text(raw: str) -> str:
+    """Strip HTML into readable paragraphs without a length limit."""
+
+    text = html_lib.unescape(raw or "")
+    text = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?i)</p\s*>|<br\s*/?>", "\n", text)
+    text = re.sub(r"<[^>]*>", " ", text)
+    paragraphs = [re.sub(r"\s+", " ", part).strip() for part in text.split("\n")]
+    return "\n\n".join(part for part in paragraphs if part)
+
+
+def _detect_transcript_format(transcript_type: str, text: str) -> str:
+    normalized = (transcript_type or "").split(";", 1)[0].strip().lower()
+    if normalized in {"text/vtt", "application/x-subrip", "application/srt"}:
+        return "cues"
+    if normalized == "application/json":
+        return "json"
+    if normalized == "text/html":
+        return "html"
+    if normalized == "text/plain":
+        return "plain"
+    stripped = text.lstrip()
+    if stripped.startswith("WEBVTT") or "-->" in text:
+        return "cues"
+    if stripped.startswith("{") or stripped.startswith("["):
+        return "json"
+    if "<" in text and ">" in text:
+        return "html"
+    return "plain"
+
+
+def fetch_publisher_transcript(url: str, transcript_type: str) -> str:
+    """Fetch a publisher-provided transcript and convert it to readable text."""
+
+    response = request_with_retry(
+        "GET", url, timeout=PAGE_TIMEOUT, headers={"User-Agent": USER_AGENT}
+    )
+    raw = response.text or ""
+    fmt = _detect_transcript_format(transcript_type, raw)
+    if fmt == "cues":
+        text = _merge_speaker_cues(_parse_cues(raw))
+    elif fmt == "json":
+        text = _json_transcript_to_text(raw)
+    elif fmt == "html":
+        text = _html_transcript_to_text(raw)
+    else:
+        text = raw.strip()
+    if len(text) < 200:
+        raise RuntimeError("publisher transcript is too short to be usable")
+    return text
+
+
 def _write_resolved(path: Path, entries: List[Dict[str, str]]) -> None:
     path.write_text(
         json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -751,7 +1001,8 @@ def _write_markdown(path: Path, entry: Dict[str, str], transcript: str) -> None:
         f"# {entry.get('episode_title', '')}\n"
         f"**Show:** {entry.get('show', '')} | **Published:** {entry.get('pub_date', '')}\n"
         f"**Source page:** {entry.get('page_url', '')}\n"
-        f"**Audio:** {entry.get('audio_url', '')}\n\n"
+        f"**Audio:** {entry.get('audio_url', '')}\n"
+        f"**Transcript source:** {entry.get('transcript_source', '')}\n\n"
         f"**Description:** {entry.get('description', '')}\n\n"
         "---\n\n"
         "## Transcript\n"
@@ -766,7 +1017,7 @@ def _table_cell(value: str) -> str:
 
 def _write_index(out_dir: Path, entries: List[Dict[str, str]]) -> None:
     lines = [
-        "# Automotive Podcast Transcripts",
+        f"# Podcast Transcripts — {out_dir.name}",
         "",
         "| Episode | Show | Source | File |",
         "| --- | --- | --- | --- |",
@@ -790,7 +1041,10 @@ def _failure_record(page_url: str) -> Dict[str, str]:
 
 
 def _summary(
-    entries: List[Dict[str, str]], failures: List[Tuple[str, str]], out_dir: Path
+    entries: List[Dict[str, str]],
+    failures: List[Tuple[str, str]],
+    out_dir: Path,
+    only_resolve: bool = False,
 ) -> None:
     # An item that resolved to audio but failed during transcription still counts
     # as resolved, which makes the stage totals useful when a rerun is needed.
@@ -805,6 +1059,72 @@ def _summary(
         f"Summary: {resolved_count} resolved, {transcribed_count} transcribed, "
         f"{len(failures)} failed{suffix}"
     )
+
+    if only_resolve:
+        publisher_count = sum(bool(entry.get("transcript_url")) for entry in entries)
+        needing_deepgram = [
+            entry
+            for entry in entries
+            if entry.get("audio_url")
+            and not entry.get("transcript_url")
+            and entry.get("status") != "transcribed"
+        ]
+        total_seconds = sum(
+            int(entry.get("duration_seconds") or 0) for entry in needing_deepgram
+        )
+        cost = total_seconds / 60 * 0.0043
+        print(
+            f"{publisher_count} have publisher transcripts "
+            f"(free, falls back to Deepgram if unusable), "
+            f"{len(needing_deepgram)} need Deepgram "
+            f"(~{total_seconds / 3600:.1f} h, est ${cost:.2f})"
+        )
+        return
+
+    publisher_count = sum(
+        entry.get("transcript_source") == "publisher" for entry in entries
+    )
+    deepgram_entries = [
+        entry for entry in entries if entry.get("transcript_source") == "deepgram"
+    ]
+    total_seconds = sum(
+        int(entry.get("duration_seconds") or 0) for entry in deepgram_entries
+    )
+    cost = total_seconds / 60 * 0.0043
+    print(
+        f"{publisher_count} via publisher (free), "
+        f"{len(deepgram_entries)} via Deepgram "
+        f"(~{total_seconds / 3600:.1f} h, est ${cost:.2f} total for this folder)"
+    )
+
+
+def _fetch_transcript(
+    entry: Dict[str, Any],
+    deepgram_key: str,
+    deepgram_key_error: Optional[Exception] = None,
+) -> Tuple[str, str]:
+    """Prefer a free publisher transcript, falling back to paid Deepgram."""
+
+    transcript_url = entry.get("transcript_url", "")
+    if transcript_url:
+        try:
+            text = fetch_publisher_transcript(
+                transcript_url, entry.get("transcript_type", "")
+            )
+            return text, "publisher"
+        except Exception as exc:
+            reason = str(exc) or exc.__class__.__name__
+            print(
+                f"publisher transcript failed for {transcript_url}: {reason}, "
+                "falling back to Deepgram",
+                file=sys.stderr,
+            )
+    if not deepgram_key:
+        raise RuntimeError(
+            "no publisher transcript and DEEPGRAM_API_KEY not set. "
+            "Add it to .env (see README)"
+        ) from deepgram_key_error
+    return transcribe_audio(entry["audio_url"], deepgram_key), "deepgram"
 
 
 def run_pipeline(urls_file: Path, out_dir: Path, only_resolve: bool = False) -> int:
@@ -840,9 +1160,14 @@ def run_pipeline(urls_file: Path, out_dir: Path, only_resolve: bool = False) -> 
         for page_url in urls
     )
     deepgram_key = ""
+    deepgram_key_error: Optional[Exception] = None
     if not only_resolve and not all_cached:
-        # Validate the paid API input before any uncached page is processed.
-        deepgram_key = read_deepgram_key()
+        # Read the paid API key when available; a missing key only fails the
+        # episodes that cannot fall back on a free publisher transcript.
+        try:
+            deepgram_key = read_deepgram_key()
+        except Exception as exc:
+            deepgram_key_error = exc
 
     resolver = Resolver()
     entries: List[Dict[str, str]] = []
@@ -869,11 +1194,13 @@ def run_pipeline(urls_file: Path, out_dir: Path, only_resolve: bool = False) -> 
             print(f"cached {page_url}")
             continue
 
-        if prior and prior.get("audio_url") and prior.get("status") in {
-            "resolved",
-            "transcribed",
-            "failed",
-        }:
+        if (
+            prior
+            and prior.get("audio_url")
+            and prior.get("status") in {"resolved", "transcribed", "failed"}
+            and "transcript_url" in prior
+            and "duration_seconds" in prior
+        ):
             entry = dict(prior)
             entry["status"] = "resolved"
             entries.append(entry)
@@ -895,7 +1222,7 @@ def run_pipeline(urls_file: Path, out_dir: Path, only_resolve: bool = False) -> 
     # Always leave a complete resolution checkpoint, including cached entries.
     _write_resolved(checkpoint_path, entries)
     if only_resolve:
-        _summary(entries, failures, out_dir)
+        _summary(entries, failures, out_dir, only_resolve=True)
         return 0
 
     candidates = [
@@ -903,21 +1230,23 @@ def run_pipeline(urls_file: Path, out_dir: Path, only_resolve: bool = False) -> 
         for index, entry in enumerate(entries)
         if entry.get("audio_url") and entry.get("status") == "resolved"
     ]
+
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_to_index = {
-            executor.submit(transcribe_audio, entry["audio_url"], deepgram_key): index
+            executor.submit(_fetch_transcript, entry, deepgram_key, deepgram_key_error): index
             for index, entry in candidates
         }
         for future in as_completed(future_to_index):
             index = future_to_index[future]
             entry = entries[index]
             try:
-                transcript = future.result()
+                transcript, source = future.result()
                 output_path = _markdown_path(out_dir, entry)
+                entry["transcript_source"] = source
                 _write_markdown(output_path, entry, transcript)
                 entry["status"] = "transcribed"
                 _write_resolved(checkpoint_path, entries)
-                print(f"transcribed {entry.get('page_url', '')}")
+                print(f"transcribed {entry.get('page_url', '')} ({source})")
             except Exception as exc:
                 reason = str(exc) or exc.__class__.__name__
                 entry["status"] = "failed"

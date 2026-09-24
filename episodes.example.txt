@@ -1,0 +1,5 @@
+# One podcast episode link per line. Apple Podcasts episode links work best.
+# Lines starting with # are ignored.
+https://podcasts.apple.com/us/podcast/221-why-dentists-cant-hire-great-staff/id1581822269?i=1000788486393
+https://podcasts.apple.com/us/podcast/the-hvac-revolution-how-this-product-is-changing-the/id1492727675?i=1000604147058
+https://podcasts.apple.com/us/podcast/celebrating-100k-subscribers-on-youtube/id1827705402?i=1000788177044
